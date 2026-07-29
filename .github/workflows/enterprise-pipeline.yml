@@ -1,0 +1,807 @@
+##############################################################################
+# springboot-cicd-template — Enterprise Reusable CI/CD Pipeline
+#
+# TWO-REPO ARCHITECTURE:
+#   This workflow lives in the TEMPLATE repo (springboot-cicd-template).
+#   It is invoked by the APPLICATION repo (springboot-api) in two ways:
+#
+#   1. workflow_call (reusable workflow) — for direct GitHub-native calls:
+#      jobs:
+#        deploy:
+#          uses: rafatusa/springboot-cicd-template/.github/workflows/enterprise-pipeline.yml@main
+#          with: { java_version: "17", image_name: "org/app", ... }
+#          secrets: inherit
+#
+#   2. workflow_dispatch (API trigger) — for cross-repo dispatch via gh api:
+#      gh api /repos/rafatusa/springboot-cicd-template/actions/workflows/enterprise-pipeline.yml/dispatches \
+#        -f ref=main \
+#        -f "inputs[app_repo]=rafatusa/springboot-api" \
+#        -f "inputs[app_ref]=<commit-sha>" \
+#        -f "inputs[image_name]=rafatusa/springboot-api" ...
+#
+# WHAT THIS PIPELINE DOES:
+#   Stage  1 — Code Quality  : Checkstyle + SpotBugs
+#   Stage  2 — Unit Tests    : Maven Surefire + JaCoCo coverage
+#   Stage  3 — Integration   : Maven Failsafe
+#   Stage  4 — Security Scan : OWASP Dependency Check
+#   Stage  5 — Build JAR     : mvn package
+#   Stage  6 — Docker Push   : Multi-stage build → GHCR
+#   Stage  7 — Provision     : Terraform (EC2 + EIP + SG + IAM)
+#   Stage  8 — Configure     : Ansible (Docker, nginx, app deployment)
+#   Stage  9 — Verify        : Health check with retries
+#   Stage 10 — Smoke Tests   : curl-based API validation
+#   Stage 11 — Performance   : k6 load test (50 VUs, 180s, p95<500ms)
+#   Stage 12 — Notify        : Summary + auto-rollback on failure
+##############################################################################
+name: Enterprise CI/CD Pipeline
+
+on:
+  ##########################################################################
+  # Trigger 1: workflow_call — called from another repo with secrets: inherit
+  ##########################################################################
+  workflow_call:
+    inputs:
+      app_repo:
+        description: "Source repository (owner/repo) to check out"
+        required: false
+        type: string
+        default: ""
+      app_ref:
+        description: "Git ref (SHA or branch) of the app repo to deploy"
+        required: false
+        type: string
+        default: ""
+      java_version:
+        description: "Java version"
+        required: false
+        type: string
+        default: "17"
+      maven_args:
+        description: "Extra Maven arguments"
+        required: false
+        type: string
+        default: "--no-transfer-progress"
+      image_name:
+        description: "Docker image name (owner/repo format for GHCR)"
+        required: true
+        type: string
+      aws_region:
+        description: "AWS region"
+        required: false
+        type: string
+        default: "us-east-1"
+      instance_type:
+        description: "EC2 instance type"
+        required: false
+        type: string
+        default: "t3.small"
+      health_endpoint:
+        description: "Health check path"
+        required: false
+        type: string
+        default: "/actuator/health"
+      run_perf_tests:
+        description: "Run k6 performance tests"
+        required: false
+        type: boolean
+        default: true
+      owasp_cvss_threshold:
+        description: "OWASP CVSS threshold (build fails above this)"
+        required: false
+        type: string
+        default: "9"
+    secrets:
+      AWS_ACCESS_KEY_ID:
+        required: true
+      AWS_SECRET_ACCESS_KEY:
+        required: true
+      TF_STATE_BUCKET:
+        required: true
+      PROJECT_NAME:
+        required: true
+      SSH_PRIVATE_KEY:
+        required: true
+      SSH_PUBLIC_KEY:
+        required: true
+      SSH_USER:
+        required: true
+
+  ##########################################################################
+  # Trigger 2: workflow_dispatch — triggered via GitHub REST API from app repo
+  ##########################################################################
+  workflow_dispatch:
+    inputs:
+      app_repo:
+        description: "Source repository (owner/repo) — e.g. rafatusa/springboot-api"
+        required: true
+        type: string
+      app_ref:
+        description: "Git SHA or branch of the app repo"
+        required: true
+        type: string
+      java_version:
+        description: "Java version"
+        required: false
+        type: string
+        default: "17"
+      maven_args:
+        description: "Extra Maven arguments"
+        required: false
+        type: string
+        default: "--no-transfer-progress"
+      image_name:
+        description: "Docker image name (owner/app format)"
+        required: true
+        type: string
+      aws_region:
+        description: "AWS region"
+        required: false
+        type: string
+        default: "us-east-1"
+      instance_type:
+        description: "EC2 instance type"
+        required: false
+        type: string
+        default: "t3.small"
+      health_endpoint:
+        description: "Health check path"
+        required: false
+        type: string
+        default: "/actuator/health"
+      run_perf_tests:
+        description: "Run k6 performance tests"
+        required: false
+        type: choice
+        default: "true"
+        options: ["true", "false"]
+      owasp_cvss_threshold:
+        description: "OWASP CVSS threshold"
+        required: false
+        type: string
+        default: "9"
+
+##############################################################################
+# Shared defaults
+##############################################################################
+defaults:
+  run:
+    shell: bash
+
+##############################################################################
+# Stage 1: Code Quality — Checkstyle + SpotBugs
+##############################################################################
+jobs:
+  lint:
+    name: "Stage 1 · Code Quality (Checkstyle + SpotBugs)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout app repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.app_repo != '' && inputs.app_repo || github.repository }}
+          ref: ${{ inputs.app_ref != '' && inputs.app_ref || github.sha }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Java ${{ inputs.java_version }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java_version }}
+          distribution: temurin
+          cache: maven
+
+      - name: Checkstyle
+        run: mvn -B checkstyle:check ${{ inputs.maven_args }}
+
+      - name: SpotBugs static analysis
+        run: mvn -B spotbugs:check ${{ inputs.maven_args }}
+
+##############################################################################
+# Stage 2: Unit Tests + JaCoCo Coverage
+##############################################################################
+  unit-tests:
+    name: "Stage 2 · Unit Tests"
+    runs-on: ubuntu-latest
+    needs: [lint]
+    timeout-minutes: 15
+    steps:
+      - name: Checkout app repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.app_repo != '' && inputs.app_repo || github.repository }}
+          ref: ${{ inputs.app_ref != '' && inputs.app_ref || github.sha }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Java ${{ inputs.java_version }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java_version }}
+          distribution: temurin
+          cache: maven
+
+      - name: Run unit tests
+        run: mvn -B test ${{ inputs.maven_args }}
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-reports
+          path: |
+            target/surefire-reports/
+            target/site/jacoco/
+          retention-days: 7
+
+##############################################################################
+# Stage 3: Integration Tests
+##############################################################################
+  integration-tests:
+    name: "Stage 3 · Integration Tests"
+    runs-on: ubuntu-latest
+    needs: [unit-tests]
+    timeout-minutes: 20
+    steps:
+      - name: Checkout app repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.app_repo != '' && inputs.app_repo || github.repository }}
+          ref: ${{ inputs.app_ref != '' && inputs.app_ref || github.sha }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Java ${{ inputs.java_version }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java_version }}
+          distribution: temurin
+          cache: maven
+
+      - name: Run integration tests
+        run: mvn -B verify -DskipUnitTests ${{ inputs.maven_args }}
+
+      - name: Upload integration test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-reports
+          path: target/failsafe-reports/
+          retention-days: 7
+
+##############################################################################
+# Stage 4: Security Scanning — OWASP Dependency Check
+##############################################################################
+  security-scan:
+    name: "Stage 4 · Security Scan (OWASP)"
+    runs-on: ubuntu-latest
+    needs: [lint]
+    timeout-minutes: 25
+    steps:
+      - name: Checkout app repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.app_repo != '' && inputs.app_repo || github.repository }}
+          ref: ${{ inputs.app_ref != '' && inputs.app_ref || github.sha }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Java ${{ inputs.java_version }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java_version }}
+          distribution: temurin
+          cache: maven
+
+      - name: OWASP Dependency Check
+        run: |
+          mvn -B org.owasp:dependency-check-maven:check \
+            -DfailBuildOnCVSS=${{ inputs.owasp_cvss_threshold }} \
+            ${{ inputs.maven_args }}
+
+      - name: Upload OWASP report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: owasp-security-report
+          path: target/dependency-check-report.*
+          retention-days: 30
+
+##############################################################################
+# Stage 5: Build Application JAR
+##############################################################################
+  build:
+    name: "Stage 5 · Build JAR"
+    runs-on: ubuntu-latest
+    needs: [unit-tests, integration-tests, security-scan]
+    timeout-minutes: 15
+    steps:
+      - name: Checkout app repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.app_repo != '' && inputs.app_repo || github.repository }}
+          ref: ${{ inputs.app_ref != '' && inputs.app_ref || github.sha }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Java ${{ inputs.java_version }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java_version }}
+          distribution: temurin
+          cache: maven
+
+      - name: Build JAR
+        run: mvn -B package -DskipTests ${{ inputs.maven_args }}
+
+      - name: Upload JAR artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: application-jar
+          path: target/*.jar
+          retention-days: 1
+
+##############################################################################
+# Stage 6: Docker Build & Push to GHCR
+##############################################################################
+  docker-build-push:
+    name: "Stage 6 · Docker Build & Push (GHCR)"
+    runs-on: ubuntu-latest
+    needs: [build]
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout app repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.app_repo != '' && inputs.app_repo || github.repository }}
+          ref: ${{ inputs.app_ref != '' && inputs.app_ref || github.sha }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download JAR artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: application-jar
+          path: target/
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/${{ inputs.image_name }}:${{ inputs.app_ref != '' && inputs.app_ref || github.sha }}
+            ghcr.io/${{ inputs.image_name }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+##############################################################################
+# Stage 7: Terraform Provision (EC2 + EIP + SG + IAM)
+##############################################################################
+  terraform-provision:
+    name: "Stage 7 · Terraform Provision"
+    runs-on: ubuntu-latest
+    needs: [docker-build-push]
+    timeout-minutes: 30
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: ${{ inputs.aws_region }}
+      TF_VAR_project_name: ${{ secrets.PROJECT_NAME }}
+      TF_VAR_ssh_public_key: ${{ secrets.SSH_PUBLIC_KEY }}
+      TF_VAR_region: ${{ inputs.aws_region }}
+      TF_VAR_instance_type: ${{ inputs.instance_type }}
+    outputs:
+      instance_ip: ${{ steps.tf_output.outputs.instance_ip }}
+    steps:
+      - name: Checkout app repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.app_repo != '' && inputs.app_repo || github.repository }}
+          ref: ${{ inputs.app_ref != '' && inputs.app_ref || github.sha }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        run: |
+          terraform init -input=false -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate" \
+            -backend-config="region=${{ inputs.aws_region }}"
+        working-directory: infra
+
+      - name: Terraform Validate
+        run: terraform validate
+        working-directory: infra
+
+      - name: Terraform Plan
+        run: terraform plan -input=false -out=tfplan
+        working-directory: infra
+
+      - name: Terraform Apply
+        run: terraform apply -input=false -auto-approve tfplan
+        working-directory: infra
+
+      - name: Get instance IP
+        id: tf_output
+        run: echo "instance_ip=$(terraform output -raw instance_ip)" >> "$GITHUB_OUTPUT"
+        working-directory: infra
+
+##############################################################################
+# Stage 8: Ansible Configure (Docker runtime, nginx, app container)
+##############################################################################
+  ansible-configure:
+    name: "Stage 8 · Ansible Configure"
+    runs-on: ubuntu-latest
+    needs: [terraform-provision]
+    timeout-minutes: 30
+    steps:
+      - name: Checkout app repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.app_repo != '' && inputs.app_repo || github.repository }}
+          ref: ${{ inputs.app_ref != '' && inputs.app_ref || github.sha }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Ansible
+        run: pip install ansible-core
+
+      - name: Write SSH key
+        env:
+          SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+      - name: Scan host keys
+        run: |
+          ssh-keyscan -H "${{ needs.terraform-provision.outputs.instance_ip }}" >> ~/.ssh/known_hosts
+
+      - name: Generate Ansible inventory
+        run: |
+          cat > ansible/inventory.ini <<EOF
+          [app]
+          ${{ needs.terraform-provision.outputs.instance_ip }} ansible_user=${{ secrets.SSH_USER }} ansible_ssh_private_key_file=~/.ssh/deploy_key
+          EOF
+
+      - name: Run Ansible playbook
+        env:
+          IMAGE_TAG: ${{ inputs.app_ref != '' && inputs.app_ref || github.sha }}
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN_VAL: ${{ github.token }}
+        run: |
+          ansible-playbook -i ansible/inventory.ini ansible/site.yml \
+            -e "image_tag=$IMAGE_TAG" \
+            -e "github_actor=$GITHUB_ACTOR" \
+            -e "github_token=$GITHUB_TOKEN_VAL" \
+            -e "project_name=${{ secrets.PROJECT_NAME }}"
+
+##############################################################################
+# Stage 9: Deployment Verification
+##############################################################################
+  verify:
+    name: "Stage 9 · Deployment Verification"
+    runs-on: ubuntu-latest
+    needs: [ansible-configure, terraform-provision]
+    timeout-minutes: 15
+    steps:
+      - name: Checkout app repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.app_repo != '' && inputs.app_repo || github.repository }}
+          ref: ${{ inputs.app_ref != '' && inputs.app_ref || github.sha }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform Init (read outputs)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ inputs.aws_region }}
+        run: |
+          terraform init -input=false -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate" \
+            -backend-config="region=${{ inputs.aws_region }}"
+        working-directory: infra
+
+      - name: Get instance IP
+        id: get_ip
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ inputs.aws_region }}
+        run: echo "instance_ip=$(terraform output -raw instance_ip)" >> "$GITHUB_OUTPUT"
+        working-directory: infra
+
+      - name: Health check with retries
+        run: |
+          curl --fail --retry 15 --retry-delay 20 --retry-all-errors \
+            http://${{ steps.get_ip.outputs.instance_ip }}${{ inputs.health_endpoint }}
+
+##############################################################################
+# Stage 10: Smoke Tests
+##############################################################################
+  smoke-tests:
+    name: "Stage 10 · Smoke Tests"
+    runs-on: ubuntu-latest
+    needs: [verify]
+    timeout-minutes: 15
+    steps:
+      - name: Checkout app repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.app_repo != '' && inputs.app_repo || github.repository }}
+          ref: ${{ inputs.app_ref != '' && inputs.app_ref || github.sha }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform Init (read outputs)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ inputs.aws_region }}
+        run: |
+          terraform init -input=false -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate" \
+            -backend-config="region=${{ inputs.aws_region }}"
+        working-directory: infra
+
+      - name: Get instance IP
+        id: get_ip
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ inputs.aws_region }}
+        run: echo "instance_ip=$(terraform output -raw instance_ip)" >> "$GITHUB_OUTPUT"
+        working-directory: infra
+
+      - name: Run smoke test suite
+        run: |
+          BASE="http://${{ steps.get_ip.outputs.instance_ip }}"
+          echo "=== Smoke Test Suite ==="
+
+          echo "1. Testing landing page (/)..."
+          curl --fail --silent --show-error "$BASE/"
+
+          echo "2. Testing health endpoint..."
+          HEALTH=$(curl --fail --silent "$BASE/actuator/health")
+          echo "$HEALTH"
+          echo "$HEALTH" | grep -q '"status":"UP"'
+
+          echo "3. Testing info endpoint..."
+          curl --fail --silent "$BASE/actuator/info"
+
+          echo "4. Testing items list (GET /api/v1/items)..."
+          ITEMS=$(curl --fail --silent "$BASE/api/v1/items")
+          echo "$ITEMS" | grep -q '"success":true'
+
+          echo "5. Testing create item (POST /api/v1/items)..."
+          CREATE=$(curl --fail --silent -X POST "$BASE/api/v1/items" \
+            -H "Content-Type: application/json" \
+            -d '{"name":"smoke-test-item","description":"created by smoke test"}')
+          echo "$CREATE" | grep -q '"success":true'
+          ITEM_ID=$(echo "$CREATE" | grep -o '"id":[0-9]*' | head -1 | grep -o '[0-9]*')
+
+          echo "6. Testing get item by ID (GET /api/v1/items/$ITEM_ID)..."
+          curl --fail --silent "$BASE/api/v1/items/$ITEM_ID"
+
+          echo ""
+          echo "=== All smoke tests PASSED ==="
+
+##############################################################################
+# Stage 11: Performance Tests (k6)
+##############################################################################
+  performance-tests:
+    name: "Stage 11 · Performance Tests (k6)"
+    runs-on: ubuntu-latest
+    needs: [smoke-tests]
+    if: ${{ inputs.run_perf_tests == true || inputs.run_perf_tests == 'true' }}
+    timeout-minutes: 20
+    steps:
+      - name: Checkout app repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.app_repo != '' && inputs.app_repo || github.repository }}
+          ref: ${{ inputs.app_ref != '' && inputs.app_ref || github.sha }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform Init (read outputs)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ inputs.aws_region }}
+        run: |
+          terraform init -input=false -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate" \
+            -backend-config="region=${{ inputs.aws_region }}"
+        working-directory: infra
+
+      - name: Get instance IP
+        id: get_ip
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ inputs.aws_region }}
+        run: echo "instance_ip=$(terraform output -raw instance_ip)" >> "$GITHUB_OUTPUT"
+        working-directory: infra
+
+      - name: Install k6
+        run: |
+          curl -s https://dl.k6.io/key.gpg \
+            | sudo gpg --dearmor -o /usr/share/keyrings/k6-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" \
+            | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update --quiet && sudo apt-get install -y k6
+
+      - name: Run k6 load test
+        run: |
+          k6 run \
+            --env BASE_URL="http://${{ steps.get_ip.outputs.instance_ip }}" \
+            tests/performance/load-test.js
+
+      - name: Upload k6 results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: k6-performance-results
+          path: k6-results.json
+          retention-days: 7
+
+##############################################################################
+# Stage 12: Notify & Rollback Gate
+##############################################################################
+  notify:
+    name: "Stage 12 · Notify & Rollback Gate"
+    runs-on: ubuntu-latest
+    needs:
+      - lint
+      - unit-tests
+      - integration-tests
+      - security-scan
+      - build
+      - docker-build-push
+      - terraform-provision
+      - ansible-configure
+      - verify
+      - smoke-tests
+      - performance-tests
+    if: always()
+    timeout-minutes: 5
+    steps:
+      - name: Deployment summary
+        run: |
+          echo "## 🚀 Enterprise Pipeline Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| # | Stage | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| 1 | Code Quality (Checkstyle + SpotBugs) | ${{ needs.lint.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 2 | Unit Tests | ${{ needs.unit-tests.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 3 | Integration Tests | ${{ needs.integration-tests.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 4 | Security Scan (OWASP) | ${{ needs.security-scan.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 5 | Build JAR | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 6 | Docker Build & Push | ${{ needs.docker-build-push.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 7 | Terraform Provision | ${{ needs.terraform-provision.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 8 | Ansible Configure | ${{ needs.ansible-configure.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 9 | Deployment Verification | ${{ needs.verify.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 10 | Smoke Tests | ${{ needs.smoke-tests.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 11 | Performance Tests (k6) | ${{ needs.performance-tests.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Template repo**: rafatusa/springboot-cicd-template" >> $GITHUB_STEP_SUMMARY
+          echo "**App ref**: ${{ inputs.app_ref }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Triggered by**: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+
+##############################################################################
+# Auto-rollback: triggers if any stage after docker-build-push fails
+##############################################################################
+  rollback:
+    name: "Auto-Rollback — Re-deploy previous image"
+    runs-on: ubuntu-latest
+    needs: [notify, terraform-provision]
+    if: failure() && needs.terraform-provision.result == 'success'
+    timeout-minutes: 30
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: ${{ inputs.aws_region }}
+      TF_VAR_project_name: ${{ secrets.PROJECT_NAME }}
+      TF_VAR_ssh_public_key: ${{ secrets.SSH_PUBLIC_KEY }}
+      TF_VAR_region: ${{ inputs.aws_region }}
+    steps:
+      - name: Checkout app repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.app_repo != '' && inputs.app_repo || github.repository }}
+          ref: ${{ inputs.app_ref != '' && inputs.app_ref || github.sha }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 2
+
+      - name: Get previous commit SHA
+        id: prev_commit
+        run: echo "sha=$(git rev-parse HEAD~1)" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        run: |
+          terraform init -input=false -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate" \
+            -backend-config="region=${{ inputs.aws_region }}"
+        working-directory: infra
+
+      - name: Get instance IP for rollback
+        id: get_ip
+        run: echo "instance_ip=$(terraform output -raw instance_ip)" >> "$GITHUB_OUTPUT"
+        working-directory: infra
+
+      - name: Install Ansible
+        run: pip install ansible-core
+
+      - name: Write SSH key
+        env:
+          SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+      - name: Scan host keys
+        run: ssh-keyscan -H "${{ steps.get_ip.outputs.instance_ip }}" >> ~/.ssh/known_hosts
+
+      - name: Generate inventory
+        run: |
+          cat > ansible/inventory.ini <<EOF
+          [app]
+          ${{ steps.get_ip.outputs.instance_ip }} ansible_user=${{ secrets.SSH_USER }} ansible_ssh_private_key_file=~/.ssh/deploy_key
+          EOF
+
+      - name: Rollback — re-deploy previous image
+        env:
+          IMAGE_TAG: ${{ steps.prev_commit.outputs.sha }}
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN_VAL: ${{ github.token }}
+        run: |
+          echo "=== ROLLBACK: Re-deploying image tag $IMAGE_TAG ==="
+          ansible-playbook -i ansible/inventory.ini ansible/site.yml \
+            -e "image_tag=$IMAGE_TAG" \
+            -e "github_actor=$GITHUB_ACTOR" \
+            -e "github_token=$GITHUB_TOKEN_VAL" \
+            -e "project_name=${{ secrets.PROJECT_NAME }}"
+
+      - name: Annotate rollback in summary
+        run: |
+          echo "## ⚠️ AUTO-ROLLBACK EXECUTED" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "A stage failed after Docker push. Rolled back to: \`${{ steps.prev_commit.outputs.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "The previous stable image is now running on the EC2 instance." >> $GITHUB_STEP_SUMMARY
